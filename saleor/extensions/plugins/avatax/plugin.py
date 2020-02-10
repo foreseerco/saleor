@@ -5,7 +5,6 @@ from urllib.parse import urljoin
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.utils.translation import pgettext_lazy
 from prices import Money, TaxedMoney, TaxedMoneyRange
 
 from ....core.taxes import TaxError, TaxType, zero_taxed_money
@@ -30,9 +29,13 @@ from . import (
 from .tasks import api_post_request_task
 
 if TYPE_CHECKING:
+    # flake8: noqa
     from ....checkout.models import Checkout, CheckoutLine
     from ....order.models import Order, OrderLine
+    from ....product.models import Product, ProductType
     from ...models import PluginConfiguration
+    from ....discount.types import DiscountsListType
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,45 +45,32 @@ class AvataxPlugin(BasePlugin):
     CONFIG_STRUCTURE = {
         "Username or account": {
             "type": ConfigurationTypeField.STRING,
-            "help_text": pgettext_lazy(
-                "Plugin help text", "Provide user or account details"
-            ),
-            "label": pgettext_lazy("Plugin label", "Username or account"),
+            "help_text": "Provide user or account details",
+            "label": "Username or account",
         },
         "Password or license": {
-            "type": ConfigurationTypeField.STRING,
-            "help_text": pgettext_lazy(
-                "Plugin help text", "Provide password or license details"
-            ),
-            "label": pgettext_lazy("Plugin label", "Password or license"),
+            "type": ConfigurationTypeField.PASSWORD,
+            "help_text": "Provide password or license details",
+            "label": "Password or license",
         },
         "Use sandbox": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text",
-                "Determines if Saleor should use Avatax sandbox API.",
-            ),
-            "label": pgettext_lazy("Plugin label", "Use sandbox"),
+            "help_text": "Determines if Saleor should use Avatax sandbox API.",
+            "label": "Use sandbox",
         },
         "Company name": {
             "type": ConfigurationTypeField.STRING,
-            "help_text": pgettext_lazy(
-                "Plugin help text",
-                "Avalara needs to receive company code. Some more "
-                "complicated systems can use more than one company "
-                "code, in that case, this variable should be changed "
-                "based on data from Avalara's admin panel",
-            ),
-            "label": pgettext_lazy("Plugin label", "Company name"),
+            "help_text": "Avalara needs to receive company code. Some more "
+            "complicated systems can use more than one company "
+            "code, in that case, this variable should be changed "
+            "based on data from Avalara's admin panel",
+            "label": "Company name",
         },
         "Autocommit": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text",
-                "Determines, if all transactions sent to Avalara "
-                "should be committed by default.",
-            ),
-            "label": pgettext_lazy("Plugin label", "Autocommit"),
+            "help_text": "Determines, if all transactions sent to Avalara "
+            "should be committed by default.",
+            "label": "Autocommit",
         },
     }
 
@@ -99,9 +89,9 @@ class AvataxPlugin(BasePlugin):
             self.config = AvataxConfiguration(
                 username_or_account=configuration["Username or account"],
                 password_or_license=configuration["Password or license"],
-                use_sandbox=configuration["Use sandbox"] == "true",
+                use_sandbox=configuration["Use sandbox"],
                 company_name=configuration["Company name"],
-                autocommit=configuration["Autocommit"] == "true",
+                autocommit=configuration["Autocommit"],
             )
         else:
             # This should be removed after we drop an Avatax's settings from Django
@@ -139,7 +129,7 @@ class AvataxPlugin(BasePlugin):
     def calculate_checkout_total(
         self,
         checkout: "Checkout",
-        discounts: List["DiscountInfo"],
+        discounts: "DiscountsListType",
         previous_value: TaxedMoney,
     ) -> TaxedMoney:
         self._initialize_plugin_configuration()
@@ -147,12 +137,13 @@ class AvataxPlugin(BasePlugin):
         if self._skip_plugin(previous_value):
             return previous_value
 
-        checkout_total = checkout.get_total(discounts=discounts)
+        checkout_total = previous_value
+
         if not _validate_checkout(checkout):
-            return TaxedMoney(net=checkout_total, gross=checkout_total)
+            return checkout_total
         response = get_checkout_tax_data(checkout, discounts, self.config)
         if not response or "error" in response:
-            return TaxedMoney(net=checkout_total, gross=checkout_total)
+            return checkout_total
 
         currency = response.get("currencyCode")
         tax = Decimal(response.get("totalTax", 0.0))
@@ -182,7 +173,7 @@ class AvataxPlugin(BasePlugin):
     def calculate_checkout_subtotal(
         self,
         checkout: "Checkout",
-        discounts: List["DiscountInfo"],
+        discounts: "DiscountsListType",
         previous_value: TaxedMoney,
     ) -> TaxedMoney:
         self._initialize_plugin_configuration()
@@ -190,22 +181,22 @@ class AvataxPlugin(BasePlugin):
         if self._skip_plugin(previous_value):
             return previous_value
 
-        sub_total = checkout.get_subtotal(discounts)
+        base_subtotal = previous_value
         if not _validate_checkout(checkout):
-            return TaxedMoney(net=sub_total, gross=sub_total)
+            return base_subtotal
 
         response = get_checkout_tax_data(checkout, discounts, self.config)
         if not response or "error" in response:
-            return TaxedMoney(net=sub_total, gross=sub_total)
+            return base_subtotal
 
-        currency = response.get("currencyCode")
+        currency = str(response.get("currencyCode"))
         return self._calculate_checkout_subtotal(currency, response.get("lines", []))
 
     def _calculate_checkout_shipping(
-        self, currency: str, lines: List[Dict], shipping_price: Money
+        self, currency: str, lines: List[Dict], shipping_price: TaxedMoney
     ) -> TaxedMoney:
         shipping_tax = Decimal(0.0)
-        shipping_net = shipping_price.amount
+        shipping_net = shipping_price.net.amount
         for line in lines:
             if line["itemCode"] == "Shipping":
                 shipping_net = Decimal(line["lineAmount"])
@@ -219,7 +210,7 @@ class AvataxPlugin(BasePlugin):
     def calculate_checkout_shipping(
         self,
         checkout: "Checkout",
-        discounts: List["DiscountInfo"],
+        discounts: "DiscountsListType",
         previous_value: TaxedMoney,
     ) -> TaxedMoney:
         self._initialize_plugin_configuration()
@@ -227,21 +218,21 @@ class AvataxPlugin(BasePlugin):
         if self._skip_plugin(previous_value):
             return previous_value
 
-        shipping_price = checkout.get_shipping_price()
+        base_shipping_price = previous_value
         if not _validate_checkout(checkout):
-            return TaxedMoney(net=shipping_price, gross=shipping_price)
+            return base_shipping_price
 
         response = get_checkout_tax_data(checkout, discounts, self.config)
         if not response or "error" in response:
-            return TaxedMoney(net=shipping_price, gross=shipping_price)
+            return base_shipping_price
 
-        currency = response.get("currencyCode")
+        currency = str(response.get("currencyCode"))
         return self._calculate_checkout_shipping(
-            currency, response.get("lines", []), shipping_price
+            currency, response.get("lines", []), base_shipping_price
         )
 
     def preprocess_order_creation(
-        self, checkout: "Checkout", discounts: List["DiscountInfo"], previous_value: Any
+        self, checkout: "Checkout", discounts: "DiscountsListType", previous_value: Any
     ):
         """Ensure all the data is correct and we can proceed with creation of order.
 
@@ -277,7 +268,7 @@ class AvataxPlugin(BasePlugin):
             raise TaxError(customer_msg)
         return previous_value
 
-    def postprocess_order_creation(self, order: "Order", previous_value: Any) -> Any:
+    def order_created(self, order: "Order", previous_value: Any) -> Any:
         self._initialize_plugin_configuration()
 
         if not self.active:
@@ -293,7 +284,7 @@ class AvataxPlugin(BasePlugin):
     def calculate_checkout_line_total(
         self,
         checkout_line: "CheckoutLine",
-        discounts: List["DiscountInfo"],
+        discounts: "DiscountsListType",
         previous_value: TaxedMoney,
     ) -> TaxedMoney:
         self._initialize_plugin_configuration()
@@ -302,9 +293,11 @@ class AvataxPlugin(BasePlugin):
             return previous_value
 
         checkout = checkout_line.checkout
-        total = checkout_line.get_total(discounts)
+        base_total = previous_value
+
         if not _validate_checkout(checkout):
-            return TaxedMoney(net=total, gross=total)
+            return base_total
+
         taxes_data = get_checkout_tax_data(checkout, discounts, self.config)
         currency = taxes_data.get("currencyCode")
         for line in taxes_data.get("lines", []):
@@ -315,8 +308,7 @@ class AvataxPlugin(BasePlugin):
                 line_net = Money(amount=line_net, currency=currency)
                 return TaxedMoney(net=line_net, gross=line_gross)
 
-        total = checkout_line.get_total(discounts)
-        return TaxedMoney(net=total, gross=total)
+        return base_total
 
     def _calculate_order_line_unit(self, order_line):
         order = order_line.order
@@ -363,7 +355,9 @@ class AvataxPlugin(BasePlugin):
                 net = Money(amount=net, currency=currency)
                 return TaxedMoney(net=net, gross=gross)
         return TaxedMoney(
-            net=order.shipping_method.price, gross=order.shipping_method.price
+            # Ignore typing checks because it is checked in _validate_order
+            net=order.shipping_method.price,  # type: ignore
+            gross=order.shipping_method.price,  # type: ignore
         )
 
     def get_tax_rate_type_choices(self, previous_value: Any) -> List[TaxType]:
@@ -414,13 +408,6 @@ class AvataxPlugin(BasePlugin):
             return previous_value
         return False
 
-    def taxes_are_enabled(self, previous_value: bool) -> bool:
-        self._initialize_plugin_configuration()
-
-        if not self.active:
-            return previous_value
-        return True
-
     @classmethod
     def validate_plugin_configuration(cls, plugin_configuration: "PluginConfiguration"):
         """Validate if provided configuration is correct."""
@@ -439,15 +426,8 @@ class AvataxPlugin(BasePlugin):
             )
             raise ValidationError(
                 error_msg + ", ".join(missing_fields),
-                code=ExtensionsErrorCode.PLUGIN_MISCONFIGURED,
+                code=ExtensionsErrorCode.PLUGIN_MISCONFIGURED.value,
             )
-
-    @classmethod
-    def _hide_secret_configuration_fields(cls, configuration):
-        for field in configuration:
-            if field.get("name") == "Password or license" and field.get("value"):
-                # We don't want to share our secret data
-                field["value"] = "*" * 6
 
     @classmethod
     def _get_default_configuration(cls):
@@ -456,8 +436,8 @@ class AvataxPlugin(BasePlugin):
             "description": "",
             "active": False,
             "configuration": [
-                {"name": "Username or account", "value": ""},
-                {"name": "Password or license", "value": ""},
+                {"name": "Username or account", "value": None},
+                {"name": "Password or license", "value": None},
                 {"name": "Use sandbox", "value": True},
                 {"name": "Company name", "value": "DEFAULT"},
                 {"name": "Autocommit", "value": False},

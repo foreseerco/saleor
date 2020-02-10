@@ -1,18 +1,18 @@
 from collections import defaultdict
+from typing import Dict, List, Optional
 
 import django_filters
-from django.db.models import Sum
+from django.db.models import Q, Subquery, Sum
 from graphene_django.filter import GlobalIDFilter, GlobalIDMultipleChoiceFilter
 
-from ...product.filters import (
-    T_PRODUCT_FILTER_QUERIES,
-    filter_products_by_attributes_values,
-)
+from ...product.filters import filter_products_by_attributes_values
 from ...product.models import Attribute, Category, Collection, Product, ProductType
 from ...search.backends import picker
+from ...warehouse.models import Stock
 from ..core.filters import EnumFilter, ListObjectTypeFilter, ObjectTypeFilter
 from ..core.types import FilterInputObjectType
 from ..core.types.common import PriceRangeInput
+from ..core.utils import from_global_id_strict_type
 from ..utils import filter_by_query_param, get_nodes
 from . import types
 from .enums import (
@@ -35,23 +35,30 @@ def filter_fields_containing_value(*search_fields: str):
     return _filter_qs
 
 
-def _clean_product_attributes_filter_input(filter_value) -> T_PRODUCT_FILTER_QUERIES:
+def _clean_product_attributes_filter_input(
+    filter_value,
+) -> Dict[int, List[Optional[int]]]:
     attributes = Attribute.objects.prefetch_related("values")
-    attributes_map = {attribute.slug: attribute.pk for attribute in attributes}
-    values_map = {
+    attributes_map: Dict[str, int] = {
+        attribute.slug: attribute.pk for attribute in attributes
+    }
+    values_map: Dict[str, Dict[str, int]] = {
         attr.slug: {value.slug: value.pk for value in attr.values.all()}
         for attr in attributes
     }
-    queries = defaultdict(list)
-
+    queries: Dict[int, List[Optional[int]]] = defaultdict(list)
     # Convert attribute:value pairs into a dictionary where
     # attributes are keys and values are grouped in lists
-    for attr_name, val_slug in filter_value:
+    for attr_name, val_slugs in filter_value:
         if attr_name not in attributes_map:
             raise ValueError("Unknown attribute name: %r" % (attr_name,))
         attr_pk = attributes_map[attr_name]
-        attr_val_pk = values_map[attr_name].get(val_slug, val_slug)
-        queries[attr_pk].append(attr_val_pk)
+        attr_val_pk = [
+            values_map[attr_name][val_slug]
+            for val_slug in val_slugs
+            if val_slug in values_map[attr_name]
+        ]
+        queries[attr_pk] += attr_val_pk
 
     return queries
 
@@ -91,25 +98,30 @@ def filter_products_by_collections(qs, collections):
     return qs.filter(collections__in=collections)
 
 
-def sort_qs(qs, sort_by):
-    if sort_by:
-        qs = qs.order_by(sort_by["direction"] + sort_by["field"])
-    return qs
-
-
 def filter_products_by_stock_availability(qs, stock_availability):
-    qs = qs.annotate(total_quantity=Sum("variants__quantity"))
+    total_stock = (
+        Stock.objects.select_related("product_variant")
+        .annotate_available_quantity()
+        .values("product_variant__product_id")
+        .annotate(total_quantity=Sum("available_quantity"))
+        .filter(total_quantity__lte=0)
+        .values_list("product_variant__product_id", flat=True)
+    )
     if stock_availability == StockAvailability.IN_STOCK:
-        qs = qs.filter(total_quantity__gt=0)
+        qs = qs.exclude(id__in=Subquery(total_stock))
     elif stock_availability == StockAvailability.OUT_OF_STOCK:
-        qs = qs.filter(total_quantity=0)
+        qs = qs.filter(id__in=Subquery(total_stock))
     return qs
 
 
 def filter_attributes(qs, _, value):
     if value:
-        value = [(v["slug"], v["value"]) for v in value]
-        qs = filter_products_by_attributes(qs, value)
+        value_list = []
+        for v in value:
+            slug = v["slug"]
+            values = [v["value"]] if "value" in v else v.get("values", [])
+            value_list.append((slug, values))
+        qs = filter_products_by_attributes(qs, value_list)
     return qs
 
 
@@ -118,6 +130,10 @@ def filter_categories(qs, _, value):
         categories = get_nodes(value, types.Category)
         qs = filter_products_by_categories(qs, categories)
     return qs
+
+
+def filter_has_category(qs, _, value):
+    return qs.filter(category__isnull=not value)
 
 
 def filter_collections(qs, _, value):
@@ -178,10 +194,42 @@ def filter_product_type(qs, _, value):
     return qs
 
 
+def filter_attributes_by_product_types(qs, field, value):
+    if not value:
+        return qs
+
+    if field == "in_category":
+        category_id = from_global_id_strict_type(
+            value, only_type="Category", field=field
+        )
+        category = Category.objects.filter(pk=category_id).first()
+
+        if category is None:
+            return qs.none()
+
+        tree = category.get_descendants(include_self=True)
+        product_qs = Product.objects.filter(category__in=tree)
+
+    elif field == "in_collection":
+        collection_id = from_global_id_strict_type(
+            value, only_type="Collection", field=field
+        )
+        product_qs = Product.objects.filter(collections__id=collection_id)
+
+    else:
+        raise NotImplementedError(f"Filtering by {field} is unsupported")
+
+    product_types = set(product_qs.values_list("product_type_id", flat=True))
+    return qs.filter(
+        Q(product_types__in=product_types) | Q(product_variant_types__in=product_types)
+    )
+
+
 class ProductFilter(django_filters.FilterSet):
     is_published = django_filters.BooleanFilter()
     collections = GlobalIDMultipleChoiceFilter(method=filter_collections)
     categories = GlobalIDMultipleChoiceFilter(method=filter_categories)
+    has_category = django_filters.BooleanFilter(method=filter_has_category)
     price = ObjectTypeFilter(
         input_class=PriceRangeInput, method=filter_price, field_name="price_amount"
     )
@@ -196,7 +244,8 @@ class ProductFilter(django_filters.FilterSet):
     stock_availability = EnumFilter(
         input_class=StockAvailability, method=filter_stock_availability
     )
-    product_type = GlobalIDFilter()
+    product_type = GlobalIDFilter()  # Deprecated
+    product_types = GlobalIDMultipleChoiceFilter(field_name="product_type")
     search = django_filters.CharFilter(method=filter_search)
 
     class Meta:
@@ -205,6 +254,7 @@ class ProductFilter(django_filters.FilterSet):
             "is_published",
             "collections",
             "categories",
+            "has_category",
             "price",
             "attributes",
             "stock_availability",
@@ -220,6 +270,7 @@ class CollectionFilter(django_filters.FilterSet):
     search = django_filters.CharFilter(
         method=filter_fields_containing_value("slug", "name")
     )
+    ids = GlobalIDMultipleChoiceFilter(field_name="id")
 
     class Meta:
         model = Collection
@@ -230,6 +281,7 @@ class CategoryFilter(django_filters.FilterSet):
     search = django_filters.CharFilter(
         method=filter_fields_containing_value("slug", "name", "description")
     )
+    ids = GlobalIDMultipleChoiceFilter(field_name="id")
 
     class Meta:
         model = Category
@@ -244,6 +296,7 @@ class ProductTypeFilter(django_filters.FilterSet):
     )
 
     product_type = EnumFilter(input_class=ProductTypeEnum, method=filter_product_type)
+    ids = GlobalIDMultipleChoiceFilter(field_name="id")
 
     class Meta:
         model = ProductType
@@ -256,6 +309,9 @@ class AttributeFilter(django_filters.FilterSet):
         method=filter_fields_containing_value("slug", "name")
     )
     ids = GlobalIDMultipleChoiceFilter(field_name="id")
+
+    in_collection = GlobalIDFilter(method=filter_attributes_by_product_types)
+    in_category = GlobalIDFilter(method=filter_attributes_by_product_types)
 
     class Meta:
         model = Attribute

@@ -1,12 +1,13 @@
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 import graphene
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Model, QuerySet
 
+from ...core.permissions import MenuPermissions, SitePermissions
 from ...menu import models
 from ...menu.error_codes import MenuErrorCode
 from ...menu.utils import update_menu
@@ -37,12 +38,10 @@ class MenuItemInput(graphene.InputObjectType):
 class MenuItemCreateInput(MenuItemInput):
     name = graphene.String(description="Name of the menu item.", required=True)
     menu = graphene.ID(
-        description="Menu to which item belongs to.", name="menu", required=True
+        description="Menu to which item belongs.", name="menu", required=True
     )
     parent = graphene.ID(
-        description="""
-        ID of the parent menu. If empty, menu will be top level
-        menu.""",
+        description="ID of the parent menu. If empty, menu will be top level menu.",
         name="parent",
     )
 
@@ -63,9 +62,9 @@ class MenuCreate(ModelMutation):
         )
 
     class Meta:
-        description = "Creates a new Menu"
+        description = "Creates a new Menu."
         model = models.Menu
-        permissions = ("menu.manage_menus",)
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -133,7 +132,7 @@ class MenuUpdate(ModelMutation):
     class Meta:
         description = "Updates a menu."
         model = models.Menu
-        permissions = ("menu.manage_menus",)
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -145,24 +144,28 @@ class MenuDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a menu."
         model = models.Menu
-        permissions = ("menu.manage_menus",)
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
 
 def _validate_menu_item_instance(
-    cleaned_input: dict, field: str, expected_model: Model
+    cleaned_input: dict, field: str, expected_model: Type[Model]
 ):
     """Check if the value to assign as a menu item matches the expected model."""
     item = cleaned_input.get(field)
-    if item is not None:
+    if item:
         if not isinstance(item, expected_model):
             msg = (
                 f"Enter a valid {expected_model._meta.verbose_name} ID "
                 f"(got {item._meta.verbose_name} ID)."
             )
             raise ValidationError(
-                {field: ValidationError(msg, code=MenuErrorCode.INVALID_MENU_ITEM)}
+                {
+                    field: ValidationError(
+                        msg, code=MenuErrorCode.INVALID_MENU_ITEM.value
+                    )
+                }
             )
 
 
@@ -170,15 +173,16 @@ class MenuItemCreate(ModelMutation):
     class Arguments:
         input = MenuItemCreateInput(
             required=True,
-            description="""Fields required to update a menu item.
-            Only one of 'url', 'category', 'page', 'collection' is allowed
-            per item""",
+            description=(
+                "Fields required to update a menu item. Only one of `url`, `category`, "
+                "`page`, `collection` is allowed per item."
+            ),
         )
 
     class Meta:
         description = "Creates a new menu item."
         model = models.MenuItem
-        permissions = ("menu.manage_menus",)
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -216,15 +220,16 @@ class MenuItemUpdate(MenuItemCreate):
         id = graphene.ID(required=True, description="ID of a menu item to update.")
         input = MenuItemInput(
             required=True,
-            description="""Fields required to update a menu item.
-            Only one of 'url', 'category', 'page', 'collection' is allowed
-            per item""",
+            description=(
+                "Fields required to update a menu item. Only one of `url`, `category`, "
+                "`page`, `collection` is allowed per item."
+            ),
         )
 
     class Meta:
         description = "Updates a menu item."
         model = models.MenuItem
-        permissions = ("menu.manage_menus",)
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -245,7 +250,7 @@ class MenuItemDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a menu item."
         model = models.MenuItem
-        permissions = ("menu.manage_menus",)
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -270,12 +275,12 @@ class MenuItemMove(BaseMutation):
     class Arguments:
         menu = graphene.ID(required=True, description="ID of the menu.")
         moves = graphene.List(
-            MenuItemMoveInput, required=True, description="The menu position data"
+            MenuItemMoveInput, required=True, description="The menu position data."
         )
 
     class Meta:
-        description = "Moves items of menus"
-        permissions = ("menu.manage_menus",)
+        description = "Moves items of menus."
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -288,7 +293,7 @@ class MenuItemMove(BaseMutation):
                     {
                         "parent_id": ValidationError(
                             "Cannot assign a node to itself.",
-                            code=MenuErrorCode.CANNOT_ASSIGN_NODE,
+                            code=MenuErrorCode.CANNOT_ASSIGN_NODE.value,
                         )
                     }
                 )
@@ -306,7 +311,7 @@ class MenuItemMove(BaseMutation):
                                 "Cannot assign a node as child of "
                                 "one of its descendants."
                             ),
-                            code=MenuErrorCode.CANNOT_ASSIGN_NODE,
+                            code=MenuErrorCode.CANNOT_ASSIGN_NODE.value,
                         )
                     }
                 )
@@ -370,7 +375,9 @@ class MenuItemMove(BaseMutation):
 
     @classmethod
     @transaction.atomic
-    def perform_mutation(cls, _root, info, menu: str, moves):
+    def perform_mutation(cls, _root, info, **data):
+        menu: str = data["menu"]
+        moves: List[MenuItemMoveInput] = data["moves"]
         qs = models.Menu.objects.prefetch_related("items")
         menu = cls.get_node_or_error(info, menu, only_type=Menu, field="menu", qs=qs)
 
@@ -407,7 +414,7 @@ class AssignNavigation(BaseMutation):
 
     class Meta:
         description = "Assigns storefront's navigation menus."
-        permissions = ("menu.manage_menus", "site.manage_settings")
+        permissions = (MenuPermissions.MANAGE_MENUS, SitePermissions.MANAGE_SETTINGS)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 

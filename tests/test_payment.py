@@ -2,10 +2,8 @@ from decimal import Decimal
 from unittest.mock import Mock, patch
 
 import pytest
-from prices import Money, TaxedMoney
 
-from saleor.order import OrderStatus
-from saleor.order.events import OrderEvents, OrderEventsEmails
+from saleor.checkout.calculations import checkout_total
 from saleor.payment import (
     ChargeStatus,
     GatewayError,
@@ -13,18 +11,16 @@ from saleor.payment import (
     TransactionKind,
     gateway,
 )
+from saleor.payment.error_codes import PaymentErrorCode
 from saleor.payment.interface import CreditCardInfo, GatewayConfig, GatewayResponse
 from saleor.payment.models import Payment
 from saleor.payment.utils import (
     ALLOWED_GATEWAY_KINDS,
     clean_authorize,
     clean_capture,
-    clean_mark_order_as_paid,
     create_payment,
     create_payment_information,
     create_transaction,
-    handle_fully_paid_order,
-    mark_order_as_paid,
     validate_gateway_response,
 )
 
@@ -72,9 +68,8 @@ def transaction_data(payment_dummy, gateway_response):
 @pytest.fixture
 def gateway_config():
     return GatewayConfig(
-        gateway_name="dummy",
+        gateway_name="Dummy",
         auto_capture=True,
-        template_path="template.html",
         connection_params={"secret-key": "nobodylikesspanishinqusition"},
     )
 
@@ -85,7 +80,7 @@ def transaction_token():
 
 
 @pytest.fixture
-def dummy_response(payment_dummy, transaction_data, transaction_token, card_details):
+def dummy_response(payment_dummy, transaction_token, card_details):
     return GatewayResponse(
         is_success=True,
         action_required=False,
@@ -99,122 +94,124 @@ def dummy_response(payment_dummy, transaction_data, transaction_token, card_deta
     )
 
 
-@patch("saleor.order.emails.send_payment_confirmation.delay")
-def test_handle_fully_paid_order_no_email(mock_send_payment_confirmation, order):
-    order.user = None
-    order.user_email = ""
+def test_create_payment(checkout_with_item, address):
+    checkout_with_item.billing_address = address
+    checkout_with_item.save()
 
-    handle_fully_paid_order(order)
-    event = order.events.get()
-    assert event.type == OrderEvents.ORDER_FULLY_PAID
-    assert not mock_send_payment_confirmation.called
-
-
-@patch("saleor.order.emails.send_payment_confirmation.delay")
-def test_handle_fully_paid_order(mock_send_payment_confirmation, order):
-    handle_fully_paid_order(order)
-    event_order_paid, event_email_sent = order.events.all()
-    assert event_order_paid.type == OrderEvents.ORDER_FULLY_PAID
-
-    assert event_email_sent.type == OrderEvents.EMAIL_SENT
-    assert event_email_sent.parameters == {
-        "email": order.get_customer_email(),
-        "email_type": OrderEventsEmails.PAYMENT,
-    }
-
-    mock_send_payment_confirmation.assert_called_once_with(order.pk)
-
-
-@patch("saleor.order.emails.send_fulfillment_confirmation.delay")
-@patch("saleor.order.emails.send_payment_confirmation.delay")
-def test_handle_fully_paid_order_digital_lines(
-    mock_send_payment_confirmation,
-    mock_send_fulfillment_confirmation,
-    order,
-    digital_content,
-    variant,
-    site_settings,
-):
-    site_settings.automatic_fulfillment_digital_products = True
-    site_settings.save()
-
-    variant.digital_content = digital_content
-    variant.digital_content.save()
-
-    product_type = variant.product.product_type
-    product_type.is_shipping_required = False
-    product_type.is_digital = True
-    product_type.save()
-
-    net = variant.get_price()
-    gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
-    order.lines.create(
-        product_name=str(variant.product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=3,
-        variant=variant,
-        unit_price=TaxedMoney(net=net, gross=gross),
-        tax_rate=23,
-    )
-
-    handle_fully_paid_order(order)
-
-    fulfillment = order.fulfillments.first()
-
-    event_order_paid, event_email_sent, event_order_fulfilled, event_digital_links = (
-        order.events.all()
-    )
-    assert event_order_paid.type == OrderEvents.ORDER_FULLY_PAID
-
-    assert event_email_sent.type == OrderEvents.EMAIL_SENT
-    assert event_order_fulfilled.type == OrderEvents.EMAIL_SENT
-    assert event_digital_links.type == OrderEvents.EMAIL_SENT
-
-    assert (
-        event_order_fulfilled.parameters["email_type"] == OrderEventsEmails.FULFILLMENT
-    )
-    assert (
-        event_digital_links.parameters["email_type"] == OrderEventsEmails.DIGITAL_LINKS
-    )
-
-    mock_send_payment_confirmation.assert_called_once_with(order.pk)
-    mock_send_fulfillment_confirmation.assert_called_once_with(order.pk, fulfillment.pk)
-
-    order.refresh_from_db()
-    assert order.status == OrderStatus.FULFILLED
-
-
-def test_create_payment(address, settings):
     data = {
-        "gateway": settings.DUMMY,
+        "gateway": "Dummy",
         "payment_token": "token",
-        "total": 10,
-        "currency": settings.DEFAULT_CURRENCY,
+        "total": checkout_total(checkout_with_item).gross.amount,
+        "currency": checkout_with_item.currency,
         "email": "test@example.com",
-        "billing_address": address,
         "customer_ip_address": "127.0.0.1",
+        "checkout": checkout_with_item,
     }
     payment = create_payment(**data)
-    assert payment.gateway == settings.DUMMY
+    assert payment.gateway == "Dummy"
 
     same_payment = create_payment(**data)
     assert payment == same_payment
 
 
-def test_mark_as_paid(admin_user, draft_order):
-    mark_order_as_paid(draft_order, admin_user)
-    payment = draft_order.payments.last()
-    assert payment.charge_status == ChargeStatus.FULLY_CHARGED
-    assert payment.captured_amount == draft_order.total.gross.amount
-    assert draft_order.events.last().type == (OrderEvents.ORDER_MARKED_AS_PAID)
+def test_create_payment_requires_order_or_checkout(settings):
+    data = {
+        "gateway": "Dummy",
+        "payment_token": "token",
+        "total": 10,
+        "currency": settings.DEFAULT_CURRENCY,
+        "email": "test@example.com",
+    }
+    with pytest.raises(TypeError) as e:
+        create_payment(**data)
+    assert e.value.args[0] == "Must provide checkout or order to create a payment."
 
 
-def test_clean_mark_order_as_paid(payment_txn_preauth):
-    order = payment_txn_preauth.order
-    with pytest.raises(PaymentError):
-        clean_mark_order_as_paid(order)
+def test_create_payment_from_checkout_requires_billing_address(
+    checkout_with_item, settings
+):
+    checkout_with_item.billing_address = None
+    checkout_with_item.save()
+
+    data = {
+        "gateway": "Dummy",
+        "payment_token": "token",
+        "total": checkout_total(checkout_with_item),
+        "currency": checkout_with_item.currency,
+        "email": "test@example.com",
+        "checkout": checkout_with_item,
+    }
+    with pytest.raises(PaymentError) as e:
+        create_payment(**data)
+    assert e.value.code == PaymentErrorCode.BILLING_ADDRESS_NOT_SET.value
+
+
+def test_create_payment_from_order_requires_billing_address(draft_order, settings):
+    draft_order.billing_address = None
+    draft_order.save()
+
+    data = {
+        "gateway": "Dummy",
+        "payment_token": "token",
+        "total": draft_order.total.gross.amount,
+        "currency": draft_order.currency,
+        "email": "test@example.com",
+        "order": draft_order,
+    }
+    with pytest.raises(PaymentError) as e:
+        create_payment(**data)
+    assert e.value.code == PaymentErrorCode.BILLING_ADDRESS_NOT_SET.value
+
+
+def test_create_payment_information_for_checkout_payment(address, checkout_with_item):
+    checkout_with_item.billing_address = address
+    checkout_with_item.shipping_address = address
+    checkout_with_item.save()
+    data = {
+        "gateway": "Dummy",
+        "payment_token": "token",
+        "total": checkout_total(checkout_with_item).gross.amount,
+        "currency": checkout_with_item.currency,
+        "email": "test@example.com",
+        "customer_ip_address": "127.0.0.1",
+        "checkout": checkout_with_item,
+    }
+
+    payment = create_payment(**data)
+    payment_data = create_payment_information(payment, "token", payment.total)
+
+    billing = payment_data.billing
+    shipping = payment_data.shipping
+    assert billing
+    assert billing.first_name == address.first_name
+    assert billing.last_name == address.last_name
+    assert billing.street_address_1 == address.street_address_1
+    assert billing.city == address.city
+    assert shipping == billing
+
+
+def test_create_payment_information_for_draft_order(draft_order):
+    data = {
+        "gateway": "Dummy",
+        "payment_token": "token",
+        "total": draft_order.total.gross.amount,
+        "currency": draft_order.currency,
+        "email": "test@example.com",
+        "customer_ip_address": "127.0.0.1",
+        "order": draft_order,
+    }
+
+    payment = create_payment(**data)
+    payment_data = create_payment_information(payment, "token", payment.total)
+
+    billing = payment_data.billing
+    shipping = payment_data.shipping
+    assert billing
+    assert billing.first_name == draft_order.billing_address.first_name
+    assert billing.last_name == draft_order.billing_address.last_name
+    assert billing.street_address_1 == draft_order.billing_address.street_address_1
+    assert billing.city == draft_order.billing_address.city
+    assert shipping == billing
 
 
 def test_create_transaction(transaction_data):
@@ -247,7 +244,7 @@ def test_payment_needs_to_be_active_for_any_action(func, payment_dummy):
     assert exc.value.message == NOT_ACTIVE_PAYMENT_ERROR
 
 
-@patch("saleor.payment.utils.handle_fully_paid_order")
+@patch("saleor.order.actions.handle_fully_paid_order")
 def test_gateway_charge_failed(
     mock_handle_fully_paid_order, mock_get_manager, payment_txn_preauth, dummy_response
 ):

@@ -1,7 +1,5 @@
 from django.core.exceptions import ValidationError
-from django_countries import countries
 
-from ...account.error_codes import AccountErrorCode
 from ...account.forms import get_address_form
 from ...account.models import Address
 from ...account.validators import validate_possible_number
@@ -14,7 +12,15 @@ class I18nMixin:
     """
 
     @classmethod
-    def validate_address(cls, address_data: dict, instance=None):
+    def construct_instance(cls, instance, cleaned_data):
+        pass
+
+    @classmethod
+    def clean_instance(cls, info, instance):
+        pass
+
+    @classmethod
+    def validate_address_form(cls, address_data: dict, instance=None):
         phone = address_data.get("phone", None)
         if phone:
             try:
@@ -28,24 +34,19 @@ class I18nMixin:
                     }
                 ) from exc
 
-        country_code = address_data.get("country")
-        if country_code in countries.countries.keys():
-            address_form, _ = get_address_form(address_data, address_data["country"])
-        else:
-            raise ValidationError(
-                {
-                    "country": ValidationError(
-                        "Invalid country code.", code=AccountErrorCode.INVALID
-                    )
-                }
-            )
-
+        address_form, _ = get_address_form(
+            address_data, address_data.get("country"), instance=instance
+        )
         if not address_form.is_valid():
             raise ValidationError(address_form.errors.as_data())
+        return address_form
 
+    @classmethod
+    def validate_address(cls, address_data: dict, instance=None, info=None):
+        address_form = cls.validate_address_form(address_data)
         if not instance:
             instance = Address()
 
         cls.construct_instance(instance, address_form.cleaned_data)
-        cls.clean_instance(instance)
+        cls.clean_instance(info, instance)
         return instance

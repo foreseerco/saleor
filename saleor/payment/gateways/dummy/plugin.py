@@ -1,7 +1,5 @@
 from typing import TYPE_CHECKING
 
-from django.utils.translation import pgettext_lazy
-
 from saleor.extensions import ConfigurationTypeField
 from saleor.extensions.base_plugin import BasePlugin
 
@@ -10,18 +8,16 @@ from . import (
     authorize,
     capture,
     confirm,
-    create_form,
     get_client_token,
     process_payment,
     refund,
     void,
 )
 
-GATEWAY_NAME = "dummy"
+GATEWAY_NAME = "Dummy"
 
 if TYPE_CHECKING:
     from ...interface import GatewayResponse, PaymentData, TokenConfig
-    from django import forms
 
 
 def require_active_plugin(fn):
@@ -40,18 +36,13 @@ class DummyGatewayPlugin(BasePlugin):
     CONFIG_STRUCTURE = {
         "Store customers card": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text", "Determines if Saleor should store cards."
-            ),
-            "label": pgettext_lazy("Plugin label", "Store customers card"),
+            "help_text": "Determines if Saleor should store cards.",
+            "label": "Store customers card",
         },
         "Automatic payment capture": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text",
-                "Determines if Saleor should automaticaly capture payments.",
-            ),
-            "label": pgettext_lazy("Plugin label", "Automatic payment capture"),
+            "help_text": "Determines if Saleor should automaticaly capture payments.",
+            "label": "Automatic payment capture",
         },
     }
 
@@ -62,7 +53,6 @@ class DummyGatewayPlugin(BasePlugin):
             gateway_name=GATEWAY_NAME,
             auto_capture=True,
             connection_params={},
-            template_path="",
             store_customer=False,
         )
 
@@ -77,7 +67,6 @@ class DummyGatewayPlugin(BasePlugin):
                 gateway_name=GATEWAY_NAME,
                 auto_capture=configuration["Automatic payment capture"],
                 connection_params={},
-                template_path="",
                 store_customer=configuration["Store customers card"],
             )
 
@@ -134,11 +123,10 @@ class DummyGatewayPlugin(BasePlugin):
         return process_payment(payment_information, self._get_gateway_config())
 
     @require_active_plugin
-    def create_form(
-        self, data, payment_information: "PaymentData", previous_value
-    ) -> "forms.Form":
-        return create_form(data, payment_information, {})
-
-    @require_active_plugin
     def get_client_token(self, token_config: "TokenConfig", previous_value):
         return get_client_token()
+
+    @require_active_plugin
+    def get_payment_config(self, previous_value):
+        config = self._get_gateway_config()
+        return [{"field": "store_customer_card", "value": config.store_customer}]

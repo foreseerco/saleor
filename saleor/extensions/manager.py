@@ -6,23 +6,32 @@ from django.utils.module_loading import import_string
 from django_countries.fields import Country
 from prices import Money, MoneyRange, TaxedMoney, TaxedMoneyRange
 
-from ..core.payments import Gateway, PaymentInterface
-from ..core.taxes import TaxType, quantize_price
+from ..checkout import base_calculations
+from ..core.payments import PaymentInterface
+from ..core.taxes import TaxType, quantize_price, zero_taxed_money
 from .models import PluginConfiguration
 
 if TYPE_CHECKING:
+    # flake8: noqa
+    from django.db.models.query import QuerySet
     from .base_plugin import BasePlugin
     from ..checkout.models import Checkout, CheckoutLine
-    from ..product.models import Product
-    from ..account.models import Address
+    from ..discount.types import DiscountsListType
+    from ..product.models import Product, ProductType
+    from ..account.models import Address, User
     from ..order.models import OrderLine, Order
-    from ..payment.interface import PaymentData, GatewayResponse, TokenConfig
+    from ..payment.interface import (
+        PaymentData,
+        TokenConfig,
+        GatewayResponse,
+        CustomerSource,
+    )
 
 
 class ExtensionsManager(PaymentInterface):
     """Base manager for handling plugins logic."""
 
-    plugins = None
+    plugins: list = []
 
     def __init__(self, plugins: List[str]):
         self.plugins = []
@@ -43,7 +52,7 @@ class ExtensionsManager(PaymentInterface):
 
     def __run_method_on_single_plugin(
         self,
-        plugin: "BasePlugin",
+        plugin: Optional["BasePlugin"],
         method_name: str,
         previous_value: Any,
         *args,
@@ -64,39 +73,55 @@ class ExtensionsManager(PaymentInterface):
             return previous_value
         return returned_value
 
+    def change_user_address(
+        self, address: "Address", address_type: Optional[str], user: Optional["User"]
+    ) -> "Address":
+        default_value = address
+        return self.__run_method_on_plugins(
+            "change_user_address", default_value, address, address_type, user
+        )
+
+    def checkout_quantity_changed(self, checkout: "Checkout") -> None:
+        self.__run_method_on_plugins("checkout_quantity_changed", None, checkout)
+
     def calculate_checkout_total(
-        self, checkout: "Checkout", discounts: List["DiscountInfo"]
+        self, checkout: "Checkout", discounts: "DiscountsListType"
     ) -> TaxedMoney:
-        total = checkout.get_total(discounts)
-        default_value = quantize_price(
-            TaxedMoney(net=total, gross=total), total.currency
+
+        default_value = base_calculations.base_checkout_total(
+            subtotal=self.calculate_checkout_subtotal(checkout, discounts),
+            shipping_price=self.calculate_checkout_shipping(checkout, discounts),
+            discount=checkout.discount,
+            currency=checkout.currency,
         )
         return self.__run_method_on_plugins(
             "calculate_checkout_total", default_value, checkout, discounts
         )
 
     def calculate_checkout_subtotal(
-        self, checkout: "Checkout", discounts: List["DiscountInfo"]
+        self, checkout: "Checkout", discounts: "DiscountsListType"
     ) -> TaxedMoney:
-        subtotal = checkout.get_subtotal(discounts)
-        default_value = quantize_price(
-            TaxedMoney(net=subtotal, gross=subtotal), subtotal.currency
+        line_totals = [
+            self.calculate_checkout_line_total(line, discounts) for line in checkout
+        ]
+        default_value = base_calculations.base_checkout_subtotal(
+            line_totals, checkout.currency
         )
         return self.__run_method_on_plugins(
             "calculate_checkout_subtotal", default_value, checkout, discounts
         )
 
     def calculate_checkout_shipping(
-        self, checkout: "Checkout", discounts: List["DiscountInfo"]
+        self, checkout: "Checkout", discounts: "DiscountsListType"
     ) -> TaxedMoney:
-        total = checkout.get_shipping_price()
-        total = TaxedMoney(net=total, gross=total)
-        default_value = quantize_price(total, total.currency)
+        default_value = base_calculations.base_checkout_shipping_price(checkout)
         return self.__run_method_on_plugins(
             "calculate_checkout_shipping", default_value, checkout, discounts
         )
 
     def calculate_order_shipping(self, order: "Order") -> TaxedMoney:
+        if not order.shipping_method:
+            return zero_taxed_money(order.currency)
         shipping_price = order.shipping_method.price
         default_value = quantize_price(
             TaxedMoney(net=shipping_price, gross=shipping_price),
@@ -107,11 +132,10 @@ class ExtensionsManager(PaymentInterface):
         )
 
     def calculate_checkout_line_total(
-        self, checkout_line: "CheckoutLine", discounts: List["DiscountInfo"]
+        self, checkout_line: "CheckoutLine", discounts: "DiscountsListType"
     ):
-        total = checkout_line.get_total(discounts)
-        default_value = quantize_price(
-            TaxedMoney(net=total, gross=total), total.currency
+        default_value = base_calculations.base_checkout_line_total(
+            checkout_line, discounts
         )
         return self.__run_method_on_plugins(
             "calculate_checkout_line_total", default_value, checkout_line, discounts
@@ -125,16 +149,12 @@ class ExtensionsManager(PaymentInterface):
         )
 
     def get_tax_rate_type_choices(self) -> List[TaxType]:
-        default_value = []
+        default_value: list = []
         return self.__run_method_on_plugins("get_tax_rate_type_choices", default_value)
 
     def show_taxes_on_storefront(self) -> bool:
         default_value = False
         return self.__run_method_on_plugins("show_taxes_on_storefront", default_value)
-
-    def taxes_are_enabled(self) -> bool:
-        default_value = False
-        return self.__run_method_on_plugins("taxes_are_enabled", default_value)
 
     def apply_taxes_to_product(
         self, product: "Product", price: Money, country: Country
@@ -167,101 +187,138 @@ class ExtensionsManager(PaymentInterface):
         )
 
     def preprocess_order_creation(
-        self, checkout: "Checkout", discounts: List["DiscountInfo"]
+        self, checkout: "Checkout", discounts: "DiscountsListType"
     ):
         default_value = None
         return self.__run_method_on_plugins(
             "preprocess_order_creation", default_value, checkout, discounts
         )
 
-    def postprocess_order_creation(self, order: "Order"):
+    def customer_created(self, customer: "User"):
         default_value = None
-        return self.__run_method_on_plugins(
-            "postprocess_order_creation", default_value, order
-        )
+        return self.__run_method_on_plugins("customer_created", default_value, customer)
+
+    def product_created(self, product: "Product"):
+        default_value = None
+        return self.__run_method_on_plugins("product_created", default_value, product)
+
+    def order_created(self, order: "Order"):
+        default_value = None
+        return self.__run_method_on_plugins("order_created", default_value, order)
+
+    def order_fully_paid(self, order: "Order"):
+        default_value = None
+        return self.__run_method_on_plugins("order_fully_paid", default_value, order)
+
+    def order_updated(self, order: "Order"):
+        default_value = None
+        return self.__run_method_on_plugins("order_updated", default_value, order)
+
+    def order_cancelled(self, order: "Order"):
+        default_value = None
+        return self.__run_method_on_plugins("order_cancelled", default_value, order)
+
+    def order_fulfilled(self, order: "Order"):
+        default_value = None
+        return self.__run_method_on_plugins("order_fulfilled", default_value, order)
 
     def authorize_payment(
-        self, gateway: Gateway, payment_information: "PaymentData"
+        self, gateway: str, payment_information: "PaymentData"
     ) -> "GatewayResponse":
         method_name = "authorize_payment"
         return self.__run_payment_method(gateway, method_name, payment_information)
 
     def capture_payment(
-        self, gateway: Gateway, payment_information: "PaymentData"
+        self, gateway: str, payment_information: "PaymentData"
     ) -> "GatewayResponse":
         method_name = "capture_payment"
         return self.__run_payment_method(gateway, method_name, payment_information)
 
     def refund_payment(
-        self, gateway: Gateway, payment_information: "PaymentData"
+        self, gateway: str, payment_information: "PaymentData"
     ) -> "GatewayResponse":
         method_name = "refund_payment"
         return self.__run_payment_method(gateway, method_name, payment_information)
 
     def void_payment(
-        self, gateway: Gateway, payment_information: "PaymentData"
+        self, gateway: str, payment_information: "PaymentData"
     ) -> "GatewayResponse":
         method_name = "void_payment"
         return self.__run_payment_method(gateway, method_name, payment_information)
 
     def confirm_payment(
-        self, gateway: Gateway, payment_information: "PaymentData"
+        self, gateway: str, payment_information: "PaymentData"
     ) -> "GatewayResponse":
         method_name = "confirm_payment"
         return self.__run_payment_method(gateway, method_name, payment_information)
 
     def process_payment(
-        self, gateway: Gateway, payment_information: "PaymentData"
+        self, gateway: str, payment_information: "PaymentData"
     ) -> "GatewayResponse":
         method_name = "process_payment"
         return self.__run_payment_method(gateway, method_name, payment_information)
 
-    def create_payment_form(self, data, gateway, payment_information):
-        method_name = "create_form"
-        return self.__run_payment_method(
-            gateway, method_name, payment_information, data=data
-        )
-
     def get_client_token(self, gateway, token_config: "TokenConfig") -> str:
         method_name = "get_client_token"
         default_value = None
-        gateway_name = gateway.value
-        gtw = self.get_plugin(gateway_name)
+        gtw = self.get_plugin(gateway)
         return self.__run_method_on_single_plugin(
             gtw, method_name, default_value, token_config=token_config
         )
 
     def list_payment_sources(
-        self, gateway: Gateway, customer_id: str
+        self, gateway: str, customer_id: str
     ) -> List["CustomerSource"]:
-        default_value = []
-        gateway_name = gateway.value
-        gtw = self.get_plugin(gateway_name)
+        default_value: list = []
+        gtw = self.get_plugin(gateway)
         if gtw is not None:
             return self.__run_method_on_single_plugin(
                 gtw, "list_payment_sources", default_value, customer_id=customer_id
             )
-        raise Exception(f"Payment plugin {gateway_name} is inaccessible!")
+        raise Exception(f"Payment plugin {gateway} is inaccessible!")
 
-    def list_payment_gateways(self) -> List[Gateway]:
-        payment_method = "process_payment"
+    def get_active_plugins(self, plugins=None) -> List["BasePlugin"]:
+        if plugins is None:
+            plugins = self.plugins
         return [
-            Gateway(plugin.PLUGIN_NAME)
-            for plugin in self.plugins
-            if payment_method in type(plugin).__dict__
-            and self.get_plugin_configuration(plugin.PLUGIN_NAME).active
+            plugin
+            for plugin in plugins
+            if getattr(self.get_plugin_configuration(plugin.PLUGIN_NAME), "active")
         ]
+
+    def list_payment_plugin_names(self, active_only: bool = False) -> List[str]:
+        payment_method = "process_payment"
+        plugins = self.plugins
+        if active_only:
+            plugins = self.get_active_plugins()
+        return [
+            plugin.PLUGIN_NAME
+            for plugin in plugins
+            if payment_method in type(plugin).__dict__
+        ]
+
+    def list_payment_gateways(self, active_only: bool = True) -> List[dict]:
+        payment_plugins = self.list_payment_plugin_names(active_only=active_only)
+        return [
+            {"name": plugin_name, "config": self.__get_payment_config(plugin_name)}
+            for plugin_name in payment_plugins
+        ]
+
+    def __get_payment_config(self, gateway: str) -> List[dict]:
+        method_name = "get_payment_config"
+        default_value: list = []
+        gtw = self.get_plugin(gateway)
+        return self.__run_method_on_single_plugin(gtw, method_name, default_value)
 
     def __run_payment_method(
         self,
-        gateway: Gateway,
+        gateway: str,
         method_name: str,
         payment_information: "PaymentData",
         **kwargs,
-    ) -> Optional["GatewayResposne"]:
+    ) -> "GatewayResponse":
         default_value = None
-        gateway_name = gateway.value
-        gtw = self.get_plugin(gateway_name)
+        gtw = self.get_plugin(gateway)
         if gtw is not None:
             resp = self.__run_method_on_single_plugin(
                 gtw,
@@ -274,7 +331,7 @@ class ExtensionsManager(PaymentInterface):
                 return resp
 
         raise Exception(
-            f"Payment plugin {gateway_name} for {method_name}"
+            f"Payment plugin {gateway} for {method_name}"
             " payment method is inaccessible!"
         )
 
@@ -316,14 +373,16 @@ class ExtensionsManager(PaymentInterface):
         for plugin in self.plugins:
             if plugin.PLUGIN_NAME == plugin_name:
                 return plugin
+        return None
 
     def get_plugin_configuration(self, plugin_name) -> Optional["PluginConfiguration"]:
         plugin = self.get_plugin(plugin_name)
         if plugin is not None:
             plugin_configurations_qs = PluginConfiguration.objects.all()
             return plugin.get_plugin_configuration(plugin_configurations_qs)
+        return None
 
-    def get_plugin_configurations(self) -> List["PluginConfiguration"]:
+    def get_plugin_configurations(self) -> "QuerySet[PluginConfiguration]":
         plugin_configuration_ids = []
         plugin_configurations_qs = PluginConfiguration.objects.all()
         for plugin in self.plugins:

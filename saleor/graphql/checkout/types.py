@@ -1,18 +1,42 @@
 import graphene
 import graphene_django_optimizer as gql_optimizer
+from graphql_jwt.exceptions import PermissionDenied
 
-from ...checkout import models
+from ...checkout import calculations, models
 from ...checkout.utils import get_valid_shipping_methods_for_checkout
-from ...core.taxes import zero_taxed_money
+from ...core.permissions import AccountPermissions, CheckoutPermissions
+from ...core.taxes import display_gross_prices, zero_taxed_money
 from ...extensions.manager import get_extensions_manager
 from ..core.connection import CountableDjangoObjectType
 from ..core.resolvers import resolve_meta, resolve_private_meta
 from ..core.types.meta import MetadataObjectType
-from ..core.types.money import Money, TaxedMoney
+from ..core.types.money import TaxedMoney
 from ..decorators import permission_required
 from ..giftcard.types import GiftCard
-from ..payment.enums import PaymentGatewayEnum
 from ..shipping.types import ShippingMethod
+
+
+class GatewayConfigLine(graphene.ObjectType):
+    field = graphene.String(required=True, description="Gateway config key.")
+    value = graphene.String(description="Gateway config value for key.")
+
+    class Meta:
+        description = "Payment gateway client configuration key and value pair."
+
+
+class PaymentGateway(graphene.ObjectType):
+    name = graphene.String(required=True, description="Payment gateway name.")
+    config = graphene.List(
+        graphene.NonNull(GatewayConfigLine),
+        required=True,
+        description="Payment gateway client configuration.",
+    )
+
+    class Meta:
+        description = (
+            "Available payment gateway backend with configuration "
+            "necessary to setup client."
+        )
 
 
 class CheckoutLine(CountableDjangoObjectType):
@@ -49,14 +73,12 @@ class Checkout(MetadataObjectType, CountableDjangoObjectType):
         description="Shipping methods that can be used with this order.",
     )
     available_payment_gateways = graphene.List(
-        PaymentGatewayEnum,
-        description="List of available payment gateways.",
-        required=True,
+        PaymentGateway, description="List of available payment gateways.", required=True
     )
-    email = graphene.String(description="Email of a customer", required=True)
+    email = graphene.String(description="Email of a customer.", required=True)
     gift_cards = gql_optimizer.field(
         graphene.List(
-            GiftCard, description="List of gift cards associated with this checkout"
+            GiftCard, description="List of gift cards associated with this checkout."
         ),
         model_field="gift_cards",
     )
@@ -88,18 +110,11 @@ class Checkout(MetadataObjectType, CountableDjangoObjectType):
             "shipping costs, and discounts included."
         ),
     )
-    discount_amount = graphene.Field(
-        Money,
-        deprecation_reason=(
-            "DEPRECATED: Will be removed in Saleor 2.10, use discount instead."
-        ),
-    )
 
     class Meta:
         only_fields = [
             "billing_address",
             "created",
-            "discount_amount",
             "discount_name",
             "gift_cards",
             "is_shipping_required",
@@ -114,10 +129,17 @@ class Checkout(MetadataObjectType, CountableDjangoObjectType):
             "voucher_code",
             "discount",
         ]
-        description = "Checkout object"
+        description = "Checkout object."
         model = models.Checkout
         interfaces = [graphene.relay.Node]
         filter_fields = ["token"]
+
+    @staticmethod
+    def resolve_user(root: models.Checkout, info):
+        user = info.context.user
+        if user == root.user or user.has_perm(AccountPermissions.MANAGE_USERS):
+            return root.user
+        raise PermissionDenied()
 
     @staticmethod
     def resolve_email(root: models.Checkout, info):
@@ -126,22 +148,20 @@ class Checkout(MetadataObjectType, CountableDjangoObjectType):
     @staticmethod
     def resolve_total_price(root: models.Checkout, info):
         taxed_total = (
-            info.context.extensions.calculate_checkout_total(
-                checkout=root, discounts=info.context.discounts
-            )
+            calculations.checkout_total(checkout=root, discounts=info.context.discounts)
             - root.get_total_gift_cards_balance()
         )
         return max(taxed_total, zero_taxed_money())
 
     @staticmethod
     def resolve_subtotal_price(root: models.Checkout, info):
-        return info.context.extensions.calculate_checkout_subtotal(
+        return calculations.checkout_subtotal(
             checkout=root, discounts=info.context.discounts
         )
 
     @staticmethod
     def resolve_shipping_price(root: models.Checkout, info):
-        return info.context.extensions.calculate_checkout_shipping(
+        return calculations.checkout_shipping_price(
             checkout=root, discounts=info.context.discounts
         )
 
@@ -156,6 +176,19 @@ class Checkout(MetadataObjectType, CountableDjangoObjectType):
         )
         if available is None:
             return []
+
+        manager = get_extensions_manager()
+        display_gross = display_gross_prices()
+        for shipping_method in available:
+            # ignore mypy checking because it is checked in
+            # get_valid_shipping_methods_for_checkout
+            taxed_price = manager.apply_taxes_to_shipping(
+                shipping_method.price, root.shipping_address  # type: ignore
+            )
+            if display_gross:
+                shipping_method.price = taxed_price.gross
+            else:
+                shipping_method.price = taxed_price.net
         return available
 
     @staticmethod
@@ -171,14 +204,10 @@ class Checkout(MetadataObjectType, CountableDjangoObjectType):
         return root.is_shipping_required()
 
     @staticmethod
-    @permission_required("order.manage_orders")
+    @permission_required(CheckoutPermissions.MANAGE_CHECKOUTS)
     def resolve_private_meta(root: models.Checkout, _info):
         return resolve_private_meta(root, _info)
 
     @staticmethod
     def resolve_meta(root: models.Checkout, _info):
         return resolve_meta(root, _info)
-
-    @staticmethod
-    def resolve_discount_amount(root: models.Checkout, _info):
-        return root.discount

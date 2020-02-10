@@ -1,9 +1,10 @@
 import graphene
 from django.core.exceptions import ValidationError
 
-from ...dashboard.shipping.forms import default_shipping_zone_exists
+from ...core.permissions import ShippingPermissions
 from ...shipping import models
 from ...shipping.error_codes import ShippingErrorCode
+from ...shipping.utils import default_shipping_zone_exists
 from ..core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
 from ..core.scalars import Decimal, WeightScalar
 from ..core.types.common import ShippingError
@@ -15,16 +16,16 @@ class ShippingPriceInput(graphene.InputObjectType):
     name = graphene.String(description="Name of the shipping method.")
     price = Decimal(description="Shipping price of the shipping method.")
     minimum_order_price = Decimal(
-        description="Minimum order price to use this shipping method"
+        description="Minimum order price to use this shipping method."
     )
     maximum_order_price = Decimal(
-        description="Maximum order price to use this shipping method"
+        description="Maximum order price to use this shipping method."
     )
     minimum_order_weight = WeightScalar(
-        description="Minimum order weight to use this shipping method"
+        description="Minimum order weight to use this shipping method."
     )
     maximum_order_weight = WeightScalar(
-        description="Maximum order weight to use this shipping method"
+        description="Maximum order weight to use this shipping method."
     )
     type = ShippingMethodTypeEnum(description="Shipping type: price or weight based.")
     shipping_zone = graphene.ID(
@@ -40,15 +41,16 @@ class ShippingZoneInput(graphene.InputObjectType):
         graphene.String, description="List of countries in this shipping zone."
     )
     default = graphene.Boolean(
-        description="""
-            Is default shipping zone, that will be used
-            for countries not covered by other zones."""
+        description=(
+            "Default shipping zone will be used for countries not covered by other "
+            "zones."
+        )
     )
 
 
 class ShippingZoneMixin:
     @classmethod
-    def clean_input(cls, info, instance, data):
+    def clean_input(cls, info, instance, data, input_cls=None):
         cleaned_input = super().clean_input(info, instance, data)
         default = cleaned_input.get("default")
         if default:
@@ -79,7 +81,7 @@ class ShippingZoneCreate(ShippingZoneMixin, ModelMutation):
     class Meta:
         description = "Creates a new shipping zone."
         model = models.ShippingZone
-        permissions = ("shipping.manage_shipping",)
+        permissions = (ShippingPermissions.MANAGE_SHIPPING,)
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
 
@@ -96,7 +98,7 @@ class ShippingZoneUpdate(ShippingZoneMixin, ModelMutation):
     class Meta:
         description = "Updates a new shipping zone."
         model = models.ShippingZone
-        permissions = ("shipping.manage_shipping",)
+        permissions = (ShippingPermissions.MANAGE_SHIPPING,)
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
 
@@ -108,14 +110,14 @@ class ShippingZoneDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a shipping zone."
         model = models.ShippingZone
-        permissions = ("shipping.manage_shipping",)
+        permissions = (ShippingPermissions.MANAGE_SHIPPING,)
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
 
 
 class ShippingPriceMixin:
     @classmethod
-    def clean_input(cls, info, instance, data):
+    def clean_input(cls, info, instance, data, input_cls=None):
         cleaned_input = super().clean_input(info, instance, data)
 
         # Rename the price field to price_amount (the model's)
@@ -181,13 +183,13 @@ class ShippingPriceCreate(ShippingPriceMixin, ModelMutation):
 
     class Arguments:
         input = ShippingPriceInput(
-            description="Fields required to create a shipping price", required=True
+            description="Fields required to create a shipping price.", required=True
         )
 
     class Meta:
         description = "Creates a new shipping price."
         model = models.ShippingMethod
-        permissions = ("shipping.manage_shipping",)
+        permissions = (ShippingPermissions.MANAGE_SHIPPING,)
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
 
@@ -207,13 +209,13 @@ class ShippingPriceUpdate(ShippingPriceMixin, ModelMutation):
     class Arguments:
         id = graphene.ID(description="ID of a shipping price to update.", required=True)
         input = ShippingPriceInput(
-            description="Fields required to update a shipping price", required=True
+            description="Fields required to update a shipping price.", required=True
         )
 
     class Meta:
         description = "Updates a new shipping price."
         model = models.ShippingMethod
-        permissions = ("shipping.manage_shipping",)
+        permissions = (ShippingPermissions.MANAGE_SHIPPING,)
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
 
@@ -238,7 +240,7 @@ class ShippingPriceDelete(BaseMutation):
 
     class Meta:
         description = "Deletes a shipping price."
-        permissions = ("shipping.manage_shipping",)
+        permissions = (ShippingPermissions.MANAGE_SHIPPING,)
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
 

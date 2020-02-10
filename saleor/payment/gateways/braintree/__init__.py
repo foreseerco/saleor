@@ -1,8 +1,7 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import braintree as braintree_sdk
 from django.core.exceptions import ImproperlyConfigured
-from django.utils.translation import pgettext_lazy
 
 from ... import TransactionKind
 from ...interface import (
@@ -14,7 +13,6 @@ from ...interface import (
     TokenConfig,
 )
 from .errors import DEFAULT_ERROR_MESSAGE, BraintreeException
-from .forms import BraintreePaymentForm
 
 # Error codes whitelist should be a dict of code: error_msg_override
 # if no error_msg_override is provided,
@@ -28,7 +26,7 @@ ERROR_CODES_WHITELIST = {
 
 
 def get_billing_data(payment_information: PaymentData) -> Dict:
-    billing = {}
+    billing: Dict[str, str] = {}
     if payment_information.billing:
         billing_info = payment_information.billing
         billing = {
@@ -59,9 +57,7 @@ def get_error_for_client(errors: List) -> str:
     """Filter all error messages and decides which one is visible for the client."""
     if not errors:
         return ""
-    default_msg = pgettext_lazy(
-        "payment error", "Unable to process transaction. Please try again in a moment"
-    )
+    default_msg = "Unable to process transaction. Please try again in a moment"
     for error in errors:
         if error["code"] in ERROR_CODES_WHITELIST:
             return ERROR_CODES_WHITELIST[error["code"]] or error["message"]
@@ -70,7 +66,7 @@ def get_error_for_client(errors: List) -> str:
 
 def extract_gateway_response(braintree_result) -> Dict:
     """Extract data from Braintree response that will be stored locally."""
-    errors = []
+    errors: List[Optional[Dict[str, str]]] = []
     if not braintree_result.is_success:
         errors = [
             {"code": error.code, "message": error.message}
@@ -90,10 +86,6 @@ def extract_gateway_response(braintree_result) -> Dict:
     }
 
 
-def create_form(data, payment_information):
-    return BraintreePaymentForm(data=data, payment_information=payment_information)
-
-
 def get_braintree_gateway(sandbox_mode, merchant_id, public_key, private_key):
     if not all([merchant_id, private_key, public_key]):
         raise ImproperlyConfigured("Incorrectly configured Braintree gateway.")
@@ -111,7 +103,9 @@ def get_braintree_gateway(sandbox_mode, merchant_id, public_key, private_key):
     return gateway
 
 
-def get_client_token(config: GatewayConfig, token_config: TokenConfig = None) -> str:
+def get_client_token(
+    config: GatewayConfig, token_config: Optional[TokenConfig] = None
+) -> str:
     gateway = get_braintree_gateway(**config.connection_params)
     if not token_config:
         return gateway.client_token.generate()
